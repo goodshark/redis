@@ -1,0 +1,903 @@
+/*
+ * Copyright (c) 2018, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "server.h"
+
+/* =============================================================================
+ * Global state for ACLs
+ * ==========================================================================*/
+
+rax *Users; /* Table mapping usernames to user structures. */
+user *DefaultUser;   /* Global reference to the default user.
+                        Every new connection is associated to it, if no
+                        AUTH or HELLO is used to authenticate with a
+                        different user. */
+
+struct ACLCategoryItem {
+    const char *name;
+    uint64_t flag;
+} ACLCommandCategories[] = {
+    {"keyspace", CMD_CATEGORY_KEYSPACE},
+    {"read", CMD_CATEGORY_READ},
+    {"write", CMD_CATEGORY_WRITE},
+    {"set", CMD_CATEGORY_SET},
+    {"sortedset", CMD_CATEGORY_SORTEDSET},
+    {"list", CMD_CATEGORY_LIST},
+    {"hash", CMD_CATEGORY_HASH},
+    {"string", CMD_CATEGORY_STRING},
+    {"bitmap", CMD_CATEGORY_BITMAP},
+    {"hyperloglog", CMD_CATEGORY_HYPERLOGLOG},
+    {"geo", CMD_CATEGORY_GEO},
+    {"stream", CMD_CATEGORY_STREAM},
+    {"pubsub", CMD_CATEGORY_PUBSUB},
+    {"admin", CMD_CATEGORY_ADMIN},
+    {"fast", CMD_CATEGORY_FAST},
+    {"slow", CMD_CATEGORY_SLOW},
+    {"blocking", CMD_CATEGORY_BLOCKING},
+    {"dangerous", CMD_CATEGORY_DANGEROUS},
+    {"connection", CMD_CATEGORY_CONNECTION},
+    {"transaction", CMD_CATEGORY_TRANSACTION},
+    {"scripting", CMD_CATEGORY_SCRIPTING},
+    {"",0} /* Terminator. */
+};
+
+void ACLResetSubcommandsForCommand(user *u, unsigned long id);
+
+/* =============================================================================
+ * Helper functions for the rest of the ACL implementation
+ * ==========================================================================*/
+
+/* Return zero if strings are the same, non-zero if they are not.
+ * The comparison is performed in a way that prevents an attacker to obtain
+ * information about the nature of the strings just monitoring the execution
+ * time of the function.
+ *
+ * Note that limiting the comparison length to strings up to 512 bytes we
+ * can avoid leaking any information about the password length and any
+ * possible branch misprediction related leak.
+ */
+int time_independent_strcmp(char *a, char *b) {
+    char bufa[CONFIG_AUTHPASS_MAX_LEN], bufb[CONFIG_AUTHPASS_MAX_LEN];
+    /* The above two strlen perform len(a) + len(b) operations where either
+     * a or b are fixed (our password) length, and the difference is only
+     * relative to the length of the user provided string, so no information
+     * leak is possible in the following two lines of code. */
+    unsigned int alen = strlen(a);
+    unsigned int blen = strlen(b);
+    unsigned int j;
+    int diff = 0;
+
+    /* We can't compare strings longer than our static buffers.
+     * Note that this will never pass the first test in practical circumstances
+     * so there is no info leak. */
+    if (alen > sizeof(bufa) || blen > sizeof(bufb)) return 1;
+
+    memset(bufa,0,sizeof(bufa));        /* Constant time. */
+    memset(bufb,0,sizeof(bufb));        /* Constant time. */
+    /* Again the time of the following two copies is proportional to
+     * len(a) + len(b) so no info is leaked. */
+    memcpy(bufa,a,alen);
+    memcpy(bufb,b,blen);
+
+    /* Always compare all the chars in the two buffers without
+     * conditional expressions. */
+    for (j = 0; j < sizeof(bufa); j++) {
+        diff |= (bufa[j] ^ bufb[j]);
+    }
+    /* Length must be equal as well. */
+    diff |= alen ^ blen;
+    return diff; /* If zero strings are the same. */
+}
+
+/* =============================================================================
+ * Low level ACL API
+ * ==========================================================================*/
+
+/* Given the category name the command returns the corresponding flag, or
+ * zero if there is no match. */
+uint64_t ACLGetCommandCategoryFlagByName(const char *name) {
+    for (int j = 0; ACLCommandCategories[j].flag != 0; j++) {
+        if (!strcasecmp(name,ACLCommandCategories[j].name)) {
+            return ACLCommandCategories[j].flag;
+        }
+    }
+    return 0; /* No match. */
+}
+
+/* Method for passwords/pattern comparison used for the user->passwords list
+ * so that we can search for items with listSearchKey(). */
+int ACLListMatchSds(void *a, void *b) {
+    return sdscmp(a,b) == 0;
+}
+
+/* Method to free list elements from ACL users password/ptterns lists. */
+void ACLListFreeSds(void *item) {
+    sdsfree(item);
+}
+
+/* Create a new user with the specified name, store it in the list
+ * of users (the Users global radix tree), and returns a reference to
+ * the structure representing the user.
+ *
+ * If the user with such name already exists NULL is returned. */
+user *ACLCreateUser(const char *name, size_t namelen) {
+    if (raxFind(Users,(unsigned char*)name,namelen) != raxNotFound) return NULL;
+    user *u = zmalloc(sizeof(*u));
+    u->name = sdsnewlen(name,namelen);
+    u->flags = 0;
+    u->allowed_subcommands = NULL;
+    u->passwords = listCreate();
+    u->patterns = listCreate();
+    listSetMatchMethod(u->passwords,ACLListMatchSds);
+    listSetFreeMethod(u->passwords,ACLListFreeSds);
+    listSetMatchMethod(u->patterns,ACLListMatchSds);
+    listSetFreeMethod(u->patterns,ACLListFreeSds);
+    memset(u->allowed_commands,0,sizeof(u->allowed_commands));
+    raxInsert(Users,(unsigned char*)name,namelen,u,NULL);
+    return u;
+}
+
+/* Given a command ID, this function set by reference 'word' and 'bit'
+ * so that user->allowed_commands[word] will address the right word
+ * where the corresponding bit for the provided ID is stored, and
+ * so that user->allowed_commands[word]&bit will identify that specific
+ * bit. The function returns C_ERR in case the specified ID overflows
+ * the bitmap in the user representation. */
+int ACLGetCommandBitCoordinates(uint64_t id, uint64_t *word, uint64_t *bit) {
+    if (id >= USER_COMMAND_BITS_COUNT) return C_ERR;
+    *word = id / sizeof(uint64_t) / 8;
+    *bit = 1ULL << (id % (sizeof(uint64_t) * 8));
+    return C_OK;
+}
+
+/* Check if the specified command bit is set for the specified user.
+ * The function returns 1 is the bit is set or 0 if it is not.
+ * Note that this function does not check the ALLCOMMANDS flag of the user
+ * but just the lowlevel bitmask.
+ *
+ * If the bit overflows the user internal represetation, zero is returned
+ * in order to disallow the execution of the command in such edge case. */
+int ACLGetUserCommandBit(user *u, unsigned long id) {
+    uint64_t word, bit;
+    if (ACLGetCommandBitCoordinates(id,&word,&bit) == C_ERR) return 0;
+    return (u->allowed_commands[word] & bit) != 0;
+}
+
+/* When +@all or allcommands is given, we set a reserved bit as well that we
+ * can later test, to see if the user has the right to execute "future commands",
+ * that is, commands loaded later via modules. */
+int ACLUserCanExecuteFutureCommands(user *u) {
+    return ACLGetUserCommandBit(u,USER_COMMAND_BITS_COUNT-1);
+}
+
+/* Set the specified command bit for the specified user to 'value' (0 or 1).
+ * If the bit overflows the user internal represetation, no operation
+ * is performed. As a side effect of calling this function with a value of
+ * zero, the user flag ALLCOMMANDS is cleared since it is no longer possible
+ * to skip the command bit explicit test. */
+void ACLSetUserCommandBit(user *u, unsigned long id, int value) {
+    uint64_t word, bit;
+    if (value == 0) u->flags &= ~USER_FLAG_ALLCOMMANDS;
+    if (ACLGetCommandBitCoordinates(id,&word,&bit) == C_ERR) return;
+    if (value)
+        u->allowed_commands[word] |= bit;
+    else
+        u->allowed_commands[word] &= ~bit;
+}
+
+/* This is like ACLSetUserCommandBit(), but instead of setting the specified
+ * ID, it will check all the commands in the category specified as argument,
+ * and will set all the bits corresponding to such commands to the specified
+ * value. Since the category passed by the user may be non existing, the
+ * function returns C_ERR if the category was not found, or C_OK if it was
+ * found and the operation was performed. */
+int ACLSetUserCommandBitsForCategory(user *u, const char *category, int value) {
+    uint64_t cflag = ACLGetCommandCategoryFlagByName(category);
+    if (!cflag) return C_ERR;
+    dictIterator *di = dictGetIterator(server.orig_commands);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        struct redisCommand *cmd = dictGetVal(de);
+        if (cmd->flags & cflag) {
+            ACLSetUserCommandBit(u,cmd->id,value);
+            ACLResetSubcommandsForCommand(u,cmd->id);
+        }
+    }
+    dictReleaseIterator(di);
+    return C_OK;
+}
+
+/* Return the number of commands allowed (on) and denied (off) for the user 'u'
+ * in the subset of commands flagged with the specified category name.
+ * If the categoty name is not valid, C_ERR is returend, otherwise C_OK is
+ * returned and on and off are populated by reference. */
+int ACLCountCategoryBitsForUser(user *u, unsigned long *on, unsigned long *off,
+                                const char *category)
+{
+    uint64_t cflag = ACLGetCommandCategoryFlagByName(category);
+    if (!cflag) return C_ERR;
+
+    *on = *off = 0;
+    dictIterator *di = dictGetIterator(server.orig_commands);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        struct redisCommand *cmd = dictGetVal(de);
+        if (cmd->flags & cflag) {
+            if (ACLGetUserCommandBit(u,cmd->id))
+                (*on)++;
+            else
+                (*off)++;
+        }
+    }
+    dictReleaseIterator(di);
+    return C_OK;
+}
+
+/* This function returns an SDS string representing the specified user ACL
+ * rules related to command execution, in the same format you could set them
+ * back using ACL SETUSER. The function will return just the set of rules needed
+ * to recreate the user commands bitmap, without including other user flags such
+ * as on/off, passwords and so forth. The returned string always starts with
+ * the +@all or -@all rule, depending on the user bitmap, and is followed, if
+ * needed, by the other rules needed to narrow or extend what the user can do. */
+sds ACLDescribeUserCommandRules(user *u) {
+    sds rules = sdsempty();
+    int additive;   /* If true we start from -@all and add, otherwise if
+                       false we start from +@all and remove. */
+
+    /* This code is based on a trick: as we generate the rules, we apply
+     * them to a fake user, so that as we go we still know what are the
+     * bit differences we should try to address by emitting more rules. */
+    user fu = {0};
+    user *fakeuser = &fu;
+
+    /* Here we want to understand if we should start with +@all and remove
+     * the commands corresponding to the bits that are not set in the user
+     * commands bitmap, or the contrary. Note that semantically the two are
+     * different. For instance starting with +@all and subtracting, the user
+     * will be able to execute future commands, while -@all and adding will just
+     * allow the user the run the selected commands and/or categories.
+     * How do we test for that? We use the trick of a reserved command ID bit
+     * that is set only by +@all (and its alias "allcommands"). */
+    if (ACLUserCanExecuteFutureCommands(u)) {
+        additive = 0;
+        rules = sdscat(rules,"+@all ");
+        ACLSetUser(fakeuser,"+@all",-1);
+    } else {
+        additive = 1;
+        rules = sdscat(rules,"-@all ");
+        ACLSetUser(fakeuser,"-@all",-1);
+    }
+
+    /* Try to add or subtract each category one after the other. Often a
+     * single category will not perfectly match the set of commands into
+     * it, so at the end we do a final pass adding/removing the single commands
+     * needed to make the bitmap exactly match. */
+    for (int j = 0; ACLCommandCategories[j].flag != 0; j++) {
+        unsigned long on, off;
+        ACLCountCategoryBitsForUser(u,&on,&off,ACLCommandCategories[j].name);
+        if ((additive && on > off) || (!additive && off > on)) {
+            sds op = sdsnewlen(additive ? "+@" : "-@", 2);
+            op = sdscat(op,ACLCommandCategories[j].name);
+            ACLSetUser(fakeuser,op,-1);
+            rules = sdscatsds(rules,op);
+            rules = sdscatlen(rules," ",1);
+            sdsfree(op);
+        }
+    }
+
+    /* Fix the final ACLs with single commands differences. */
+    dictIterator *di = dictGetIterator(server.orig_commands);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        struct redisCommand *cmd = dictGetVal(de);
+        int userbit = ACLGetUserCommandBit(u,cmd->id);
+        int fakebit = ACLGetUserCommandBit(fakeuser,cmd->id);
+        if (userbit != fakebit) {
+            rules = sdscatlen(rules, userbit ? "+" : "-", 1);
+            rules = sdscat(rules,cmd->name);
+            rules = sdscatlen(rules," ",1);
+            ACLSetUserCommandBit(fakeuser,cmd->id,userbit);
+        }
+
+        /* Emit the subcommands if there are any. */
+        if (userbit == 0 && u->allowed_subcommands &&
+            u->allowed_subcommands[cmd->id])
+        {
+            for (int j = 0; u->allowed_subcommands[cmd->id][j]; j++) {
+                rules = sdscatlen(rules,"+",1);
+                rules = sdscat(rules,cmd->name);
+                rules = sdscatlen(rules,"|",1);
+                rules = sdscatsds(rules,u->allowed_subcommands[cmd->id][j]);
+                rules = sdscatlen(rules," ",1);
+            }
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Trim the final useless space. */
+    sdsrange(rules,0,-2);
+
+    /* This is technically not needed, but we want to verify that now the
+     * predicted bitmap is exactly the same as the user bitmap, and abort
+     * otherwise, because aborting is better than a security risk in this
+     * code path. */
+    if (memcmp(fakeuser->allowed_commands,
+                        u->allowed_commands,
+                        sizeof(u->allowed_commands)) != 0)
+    {
+        serverLog(LL_WARNING,
+            "CRITICAL ERROR: User ACLs don't match final bitmap: '%s'",
+            rules);
+        serverPanic("No bitmap match in ACLDescribeUserCommandRules()");
+    }
+    return rules;
+}
+
+/* Get a command from the original command table, that is not affected
+ * by the command renaming operations: we base all the ACL work from that
+ * table, so that ACLs are valid regardless of command renaming. */
+struct redisCommand *ACLLookupCommand(const char *name) {
+    struct redisCommand *cmd;
+    sds sdsname = sdsnew(name);
+    cmd = dictFetchValue(server.orig_commands, sdsname);
+    sdsfree(sdsname);
+    return cmd;
+}
+
+/* Flush the array of allowed subcommands for the specified user
+ * and command ID. */
+void ACLResetSubcommandsForCommand(user *u, unsigned long id) {
+    if (u->allowed_subcommands && u->allowed_subcommands[id]) {
+        zfree(u->allowed_subcommands[id]);
+        u->allowed_subcommands[id] = NULL;
+    }
+}
+
+/* Flush the entire table of subcommands. This is useful on +@all, -@all
+ * or similar to return back to the minimal memory usage (and checks to do)
+ * for the user. */
+void ACLResetSubcommands(user *u) {
+    if (u->allowed_subcommands == NULL) return;
+    for (int j = 0; j < USER_COMMAND_BITS_COUNT; j++)
+        if (u->allowed_subcommands[j]) zfree(u->allowed_subcommands[j]);
+    zfree(u->allowed_subcommands);
+    u->allowed_subcommands = NULL;
+}
+
+
+/* Add a subcommand to the list of subcommands for the user 'u' and
+ * the command id specified. */
+void ACLAddAllowedSubcommand(user *u, unsigned long id, const char *sub) {
+    /* If this is the first subcommand to be configured for
+     * this user, we have to allocate the subcommands array. */
+    if (u->allowed_subcommands == NULL) {
+        u->allowed_subcommands = zcalloc(USER_COMMAND_BITS_COUNT *
+                                 sizeof(sds*));
+    }
+
+    /* We also need to enlarge the allocation pointing to the
+     * null terminated SDS array, to make space for this one.
+     * To start check the current size, and while we are here
+     * make sure the subcommand is not already specified inside. */
+    long items = 0;
+    if (u->allowed_subcommands[id]) {
+        while(u->allowed_subcommands[id][items]) {
+            /* If it's already here do not add it again. */
+            if (!strcasecmp(u->allowed_subcommands[id][items],sub)) return;
+            items++;
+        }
+    }
+
+    /* Now we can make space for the new item (and the null term). */
+    items += 2;
+    u->allowed_subcommands[id] = zrealloc(u->allowed_subcommands[id],
+                                 sizeof(sds)*items);
+    u->allowed_subcommands[id][items-2] = sdsnew(sub);
+    u->allowed_subcommands[id][items-1] = NULL;
+}
+
+/* Set user properties according to the string "op". The following
+ * is a description of what different strings will do:
+ *
+ * on           Enable the user: it is possible to authenticate as this user.
+ * off          Disable the user: it's no longer possible to authenticate
+ *              with this user, however the already authenticated connections
+ *              will still work.
+ * +<command>   Allow the execution of that command
+ * -<command>   Disallow the execution of that command
+ * +@<category> Allow the execution of all the commands in such category
+ *              with valid categories are like @admin, @set, @sortedset, ...
+ *              and so forth, see the full list in the server.c file where
+ *              the Redis command table is described and defined.
+ *              The special category @all means all the commands, but currently
+ *              present in the server, and that will be loaded in the future
+ *              via modules.
+ * +<command>|subcommand    Allow a specific subcommand of an otherwise
+ *                          disabled command. Note that this form is not
+ *                          allowed as negative like -DEBUG|SEGFAULT, but
+ *                          only additive starting with "+".
+ * allcommands  Alias for +@all. Note that it implies the ability to execute
+ *              all the future commands loaded via the modules system.
+ * nocommands   Alias for -@all.
+ * ~<pattern>   Add a pattern of keys that can be mentioned as part of
+ *              commands. For instance ~* allows all the keys. The pattern
+ *              is a glob-style pattern like the one of KEYS.
+ *              It is possible to specify multiple patterns.
+ * allkeys      Alias for ~*
+ * resetkeys    Flush the list of allowed keys patterns.
+ * ><password>  Add this passowrd to the list of valid password for the user.
+ *              For example >mypass will add "mypass" to the list.
+ *              This directive clears the "nopass" flag (see later).
+ * <<password>  Remove this password from the list of valid passwords.
+ * nopass       All the set passwords of the user are removed, and the user
+ *              is flagged as requiring no password: it means that every
+ *              password will work against this user. If this directive is
+ *              used for the default user, every new connection will be
+ *              immediately authenticated with the default user without
+ *              any explicit AUTH command required. Note that the "resetpass"
+ *              directive will clear this condition.
+ * resetpass    Flush the list of allowed passwords. Moreover removes the
+ *              "nopass" status. After "resetpass" the user has no associated
+ *              passwords and there is no way to authenticate without adding
+ *              some password (or setting it as "nopass" later).
+ * reset        Performs the following actions: resetpass, resetkeys, off,
+ *              -@all. The user returns to the same state it has immediately
+ *              after its creation.
+ *
+ * The 'op' string must be null terminated. The 'oplen' argument should
+ * specify the length of the 'op' string in case the caller requires to pass
+ * binary data (for instance the >password form may use a binary password).
+ * Otherwise the field can be set to -1 and the function will use strlen()
+ * to determine the length.
+ *
+ * The function returns C_OK if the action to perform was understood because
+ * the 'op' string made sense. Otherwise C_ERR is returned if the operation
+ * is unknown or has some syntax error.
+ *
+ * When an error is returned, errno is set to the following values:
+ *
+ * EINVAL: The specified opcode is not understood.
+ * ENOENT: The command name or command category provided with + or - is not
+ *         known.
+ * EBUSY:  The subcommand you want to add is about a command that is currently
+ *         fully added.
+ */
+int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    if (oplen == -1) oplen = strlen(op);
+    if (!strcasecmp(op,"on")) {
+        u->flags |= USER_FLAG_ENABLED;
+    } else if (!strcasecmp(op,"off")) {
+        u->flags &= ~USER_FLAG_ENABLED;
+    } else if (!strcasecmp(op,"allkeys") ||
+               !strcasecmp(op,"~*"))
+    {
+        u->flags |= USER_FLAG_ALLKEYS;
+        listEmpty(u->patterns);
+    } else if (!strcasecmp(op,"resetkeys")) {
+        u->flags &= ~USER_FLAG_ALLKEYS;
+        listEmpty(u->patterns);
+    } else if (!strcasecmp(op,"allcommands") ||
+               !strcasecmp(op,"+@all"))
+    {
+        memset(u->allowed_commands,255,sizeof(u->allowed_commands));
+        u->flags |= USER_FLAG_ALLCOMMANDS;
+        ACLResetSubcommands(u);
+    } else if (!strcasecmp(op,"nocommands") ||
+               !strcasecmp(op,"-@all"))
+    {
+        memset(u->allowed_commands,0,sizeof(u->allowed_commands));
+        u->flags &= ~USER_FLAG_ALLCOMMANDS;
+        ACLResetSubcommands(u);
+    } else if (!strcasecmp(op,"nopass")) {
+        u->flags |= USER_FLAG_NOPASS;
+        listEmpty(u->passwords);
+    } else if (!strcasecmp(op,"resetpass")) {
+        u->flags &= ~USER_FLAG_NOPASS;
+        listEmpty(u->passwords);
+    } else if (op[0] == '>') {
+        sds newpass = sdsnewlen(op+1,oplen-1);
+        listNode *ln = listSearchKey(u->passwords,newpass);
+        /* Avoid re-adding the same password multiple times. */
+        if (ln == NULL) listAddNodeTail(u->passwords,newpass);
+        u->flags &= ~USER_FLAG_NOPASS;
+    } else if (op[0] == '<') {
+        sds delpass = sdsnewlen(op+1,oplen-1);
+        listNode *ln = listSearchKey(u->passwords,delpass);
+        if (ln) listDelNode(u->passwords,ln);
+        sdsfree(delpass);
+    } else if (op[0] == '~') {
+        sds newpat = sdsnewlen(op+1,oplen-1);
+        listNode *ln = listSearchKey(u->patterns,newpat);
+        /* Avoid re-adding the same pattern multiple times. */
+        if (ln == NULL) listAddNodeTail(u->patterns,newpat);
+        u->flags &= ~USER_FLAG_ALLKEYS;
+    } else if (op[0] == '+' && op[1] != '@') {
+        if (strchr(op,'|') == NULL) {
+            if (ACLLookupCommand(op+1) == NULL) {
+                errno = ENOENT;
+                return C_ERR;
+            }
+            unsigned long id = ACLGetCommandID(op+1);
+            ACLSetUserCommandBit(u,id,1);
+            ACLResetSubcommandsForCommand(u,id);
+        } else {
+            /* Split the command and subcommand parts. */
+            char *copy = zstrdup(op+1);
+            char *sub = strchr(copy,'|');
+            sub[0] = '\0';
+            sub++;
+
+            /* Check if the command exists. We can't check the
+             * subcommand to see if it is valid. */
+            if (ACLLookupCommand(copy) == NULL) {
+                zfree(copy);
+                errno = ENOENT;
+                return C_ERR;
+            }
+            unsigned long id = ACLGetCommandID(copy);
+
+            /* The subcommand cannot be empty, so things like DEBUG|
+             * are syntax errors of course. */
+            if (strlen(sub) == 0) {
+                zfree(copy);
+                errno = EINVAL;
+                return C_ERR;
+            }
+
+            /* The command should not be set right now in the command
+             * bitmap, because adding a subcommand of a fully added
+             * command is probably an error on the user side. */
+            if (ACLGetUserCommandBit(u,id) == 1) {
+                zfree(copy);
+                errno = EBUSY;
+                return C_ERR;
+            }
+
+            /* Add the subcommand to the list of valid ones. */
+            ACLAddAllowedSubcommand(u,id,sub);
+
+            /* We have to clear the command bit so that we force the
+             * subcommand check. */
+            ACLSetUserCommandBit(u,id,0);
+            zfree(copy);
+        }
+    } else if (op[0] == '-' && op[1] != '@') {
+        if (ACLLookupCommand(op+1) == NULL) {
+            errno = ENOENT;
+            return C_ERR;
+        }
+        unsigned long id = ACLGetCommandID(op+1);
+        ACLSetUserCommandBit(u,id,0);
+        ACLResetSubcommandsForCommand(u,id);
+    } else if ((op[0] == '+' || op[0] == '-') && op[1] == '@') {
+        int bitval = op[0] == '+' ? 1 : 0;
+        if (ACLSetUserCommandBitsForCategory(u,op+2,bitval) == C_ERR) {
+            errno = ENOENT;
+            return C_ERR;
+        }
+    } else if (!strcasecmp(op,"reset")) {
+        serverAssert(ACLSetUser(u,"resetpass",-1) == C_OK);
+        serverAssert(ACLSetUser(u,"resetkeys",-1) == C_OK);
+        serverAssert(ACLSetUser(u,"off",-1) == C_OK);
+        serverAssert(ACLSetUser(u,"-@all",-1) == C_OK);
+    } else {
+        errno = EINVAL;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Return the first password of the default user or NULL.
+ * This function is needed for backward compatibility with the old
+ * directive "requirepass" when Redis supported a single global
+ * password. */
+sds ACLDefaultUserFirstPassword(void) {
+    if (listLength(DefaultUser->passwords) == 0) return NULL;
+    listNode *first = listFirst(DefaultUser->passwords);
+    return listNodeValue(first);
+}
+
+/* Initialization of the ACL subsystem. */
+void ACLInit(void) {
+    Users = raxNew();
+    DefaultUser = ACLCreateUser("default",7);
+    ACLSetUser(DefaultUser,"+@all",-1);
+    ACLSetUser(DefaultUser,"~*",-1);
+    ACLSetUser(DefaultUser,"on",-1);
+    ACLSetUser(DefaultUser,"nopass",-1);
+}
+
+/* Check the username and password pair and return C_OK if they are valid,
+ * otherwise C_ERR is returned and errno is set to:
+ *
+ *  EINVAL: if the username-password do not match.
+ *  ENONENT: if the specified user does not exist at all.
+ */
+int ACLCheckUserCredentials(robj *username, robj *password) {
+    user *u = ACLGetUserByName(username->ptr,sdslen(username->ptr));
+    if (u == NULL) {
+        errno = ENOENT;
+        return C_ERR;
+    }
+
+    /* Disabled users can't login. */
+    if ((u->flags & USER_FLAG_ENABLED) == 0) {
+        errno = EINVAL;
+        return C_ERR;
+    }
+
+    /* If the user is configured to don't require any password, we
+     * are already fine here. */
+    if (u->flags & USER_FLAG_NOPASS) return C_OK;
+
+    /* Check all the user passwords for at least one to match. */
+    listIter li;
+    listNode *ln;
+    listRewind(u->passwords,&li);
+    while((ln = listNext(&li))) {
+        sds thispass = listNodeValue(ln);
+        if (!time_independent_strcmp(password->ptr, thispass))
+            return C_OK;
+    }
+
+    /* If we reached this point, no password matched. */
+    errno = EINVAL;
+    return C_ERR;
+}
+
+/* For ACL purposes, every user has a bitmap with the commands that such
+ * user is allowed to execute. In order to populate the bitmap, every command
+ * should have an assigned ID (that is used to index the bitmap). This function
+ * creates such an ID: it uses sequential IDs, reusing the same ID for the same
+ * command name, so that a command retains the same ID in case of modules that
+ * are unloaded and later reloaded. */
+unsigned long ACLGetCommandID(const char *cmdname) {
+    static rax *map = NULL;
+    static unsigned long nextid = 0;
+
+    sds lowername = sdsnew(cmdname);
+    sdstolower(lowername);
+    if (map == NULL) map = raxNew();
+    void *id = raxFind(map,(unsigned char*)lowername,sdslen(lowername));
+    if (id != raxNotFound) {
+        sdsfree(lowername);
+        return (unsigned long)id;
+    }
+    raxInsert(map,(unsigned char*)lowername,strlen(lowername),
+              (void*)nextid,NULL);
+    sdsfree(lowername);
+    unsigned long thisid = nextid;
+    nextid++;
+
+    /* We never assign the last bit in the user commands bitmap structure,
+     * this way we can later check if this bit is set, understanding if the
+     * current ACL for the user was created starting with a +@all to add all
+     * the possible commands and just subtracting other single commands or
+     * categories, or if, instead, the ACL was created just adding commands
+     * and command categories from scratch, not allowing future commands by
+     * default (loaded via modules). This is useful when rewriting the ACLs
+     * with ACL SAVE. */
+    if (nextid == USER_COMMAND_BITS_COUNT-1) nextid++;
+    return thisid;
+}
+
+/* Return an username by its name, or NULL if the user does not exist. */
+user *ACLGetUserByName(const char *name, size_t namelen) {
+    void *myuser = raxFind(Users,(unsigned char*)name,namelen);
+    if (myuser == raxNotFound) return NULL;
+    return myuser;
+}
+
+/* Check if the command ready to be excuted in the client 'c', and already
+ * referenced by c->cmd, can be executed by this client according to the
+ * ACls associated to the client user c->user.
+ *
+ * If the user can execute the command ACL_OK is returned, otherwise
+ * ACL_DENIED_CMD or ACL_DENIED_KEY is returned: the first in case the
+ * command cannot be executed because the user is not allowed to run such
+ * command, the second if the command is denied because the user is trying
+ * to access keys that are not among the specified patterns. */
+int ACLCheckCommandPerm(client *c) {
+    user *u = c->user;
+    uint64_t id = c->cmd->id;
+
+    /* If there is no associated user, the connection can run anything. */
+    if (u == NULL) return ACL_OK;
+
+    /* Check if the user can execute this command. */
+    if (!(u->flags & USER_FLAG_ALLCOMMANDS) &&
+        c->cmd->proc != authCommand)
+    {
+        /* If the bit is not set we have to check further, in case the
+         * command is allowed just with that specific subcommand. */
+        if (ACLGetUserCommandBit(u,id) == 0) {
+            /* Check if the subcommand matches. */
+            if (c->argc < 2 ||
+                u->allowed_subcommands == NULL ||
+                u->allowed_subcommands[id] == NULL)
+            {
+                return ACL_DENIED_CMD;
+            }
+
+            long subid = 0;
+            while (1) {
+                if (u->allowed_subcommands[id][subid] == NULL)
+                    return ACL_DENIED_CMD;
+                if (!strcasecmp(c->argv[1]->ptr,
+                                u->allowed_subcommands[id][subid]))
+                    break; /* Subcommand match found. Stop here. */
+                subid++;
+            }
+        }
+    }
+
+    /* Check if the user can execute commands explicitly touching the keys
+     * mentioned in the command arguments. */
+    if (!(c->user->flags & USER_FLAG_ALLKEYS) &&
+        (c->cmd->getkeys_proc || c->cmd->firstkey))
+    {
+        int numkeys;
+        int *keyidx = getKeysFromCommand(c->cmd,c->argv,c->argc,&numkeys);
+        for (int j = 0; j < numkeys; j++) {
+            listIter li;
+            listNode *ln;
+            listRewind(u->patterns,&li);
+
+            /* Test this key against every pattern. */
+            int match = 0;
+            while((ln = listNext(&li))) {
+                sds pattern = listNodeValue(ln);
+                size_t plen = sdslen(pattern);
+                int idx = keyidx[j];
+                if (stringmatchlen(pattern,plen,c->argv[idx]->ptr,
+                                   sdslen(c->argv[idx]->ptr),0))
+                {
+                    match = 1;
+                    break;
+                }
+            }
+            if (!match) {
+                getKeysFreeResult(keyidx);
+                return ACL_DENIED_KEY;
+            }
+        }
+        getKeysFreeResult(keyidx);
+    }
+
+    /* If we survived all the above checks, the user can execute the
+     * command. */
+    return ACL_OK;
+}
+
+/* =============================================================================
+ * ACL related commands
+ * ==========================================================================*/
+
+/* ACL -- show and modify the configuration of ACL users.
+ * ACL HELP
+ * ACL LIST
+ * ACL SETUSER <username> ... user attribs ...
+ * ACL DELUSER <username>
+ * ACL GETUSER <username>
+ */
+void aclCommand(client *c) {
+    char *sub = c->argv[1]->ptr;
+    if (!strcasecmp(sub,"setuser") && c->argc >= 3) {
+        sds username = c->argv[2]->ptr;
+        user *u = ACLGetUserByName(username,sdslen(username));
+        if (!u) u = ACLCreateUser(username,sdslen(username));
+        serverAssert(u != NULL);
+        for (int j = 3; j < c->argc; j++) {
+            if (ACLSetUser(u,c->argv[j]->ptr,sdslen(c->argv[j]->ptr)) != C_OK) {
+                char *errmsg = "wrong format";
+                if (errno == ENOENT)
+                    errmsg = "unknown command or category name in ACL";
+                else if (errno == EINVAL)
+                    errmsg = "syntax error";
+                else if (errno == EBUSY)
+                    errmsg = "adding a subcommand of a command already fully "
+                             "added is not allowed. Remove the command to start. "
+                             "Example: -DEBUG +DEBUG|DIGEST";
+                addReplyErrorFormat(c,
+                    "Error in ACL SETUSER modifier '%s': %s",
+                    (char*)c->argv[j]->ptr, errmsg);
+                return;
+            }
+        }
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(sub,"whoami")) {
+        if (c->user != NULL) {
+            addReplyBulkCBuffer(c,c->user->name,sdslen(c->user->name));
+        } else {
+            addReplyNull(c);
+        }
+    } else if (!strcasecmp(sub,"getuser") && c->argc == 3) {
+        user *u = ACLGetUserByName(c->argv[2]->ptr,sdslen(c->argv[2]->ptr));
+        if (u == NULL) {
+            addReplyNull(c);
+            return;
+        }
+
+        addReplyMapLen(c,3);
+
+        /* Flags */
+        addReplyBulkCString(c,"flags");
+        void *deflen = addReplyDeferredLen(c);
+        int numflags = 0;
+        if (u->flags & USER_FLAG_ENABLED) {
+            addReplyBulkCString(c,"on");
+            numflags++;
+        } else {
+            addReplyBulkCString(c,"off");
+            numflags++;
+        }
+        if (u->flags & USER_FLAG_ALLKEYS) {
+            addReplyBulkCString(c,"allkeys");
+            numflags++;
+        }
+        if (u->flags & USER_FLAG_ALLCOMMANDS) {
+            addReplyBulkCString(c,"allcommands");
+            numflags++;
+        }
+        if (u->flags & USER_FLAG_NOPASS) {
+            addReplyBulkCString(c,"nopass");
+            numflags++;
+        }
+        setDeferredSetLen(c,deflen,numflags);
+
+        /* Passwords */
+        addReplyBulkCString(c,"passwords");
+        addReplyArrayLen(c,listLength(u->passwords));
+        listIter li;
+        listNode *ln;
+        listRewind(u->passwords,&li);
+        while((ln = listNext(&li))) {
+            sds thispass = listNodeValue(ln);
+            addReplyBulkCBuffer(c,thispass,sdslen(thispass));
+        }
+
+        /* Commands */
+        addReplyBulkCString(c,"commands");
+        sds cmddescr = ACLDescribeUserCommandRules(u);
+        addReplyBulkSds(c,cmddescr);
+    } else if (!strcasecmp(sub,"help")) {
+        const char *help[] = {
+"LIST                              -- List all the registered users.",
+"SETUSER <username> [attribs ...]  -- Create or modify a user.",
+"DELUSER <username>                -- Delete a user.",
+"GETUSER <username>                -- Get the user details.",
+"WHOAMI                            -- Return the current username.",
+NULL
+        };
+        addReplyHelp(c,help);
+    } else {
+        addReplySubcommandSyntaxError(c);
+    }
+}
